@@ -1,35 +1,37 @@
 package main
 
 import (
-	"bufio"
 	_ "embed"
-	"github.com/BaiMeow/msauth"
-	"io/ioutil"
 	"log"
 	"net"
 	"os"
 	"strconv"
 	"time"
 
+	"github.com/BaiMeow/msauth"
+
 	"github.com/Tnze/go-mc/bot"
 	"github.com/Tnze/go-mc/bot/basic"
+	"github.com/Tnze/go-mc/bot/msg"
+	"github.com/Tnze/go-mc/bot/playerlist"
 	"github.com/Tnze/go-mc/chat"
 	"github.com/Tnze/go-mc/data/entity"
 	_ "github.com/Tnze/go-mc/data/lang/zh-cn"
 	"github.com/Tnze/go-mc/data/packetid"
 	pk "github.com/Tnze/go-mc/net/packet"
 	"github.com/Tnze/go-mc/yggdrasil"
-	"github.com/google/uuid"
 	"github.com/mattn/go-colorable"
 	"github.com/spf13/viper"
 )
 
 var (
-	c        *bot.Client
-	player   *basic.Player
-	bobberID int32
-	watch    chan bool
-	vp       *viper.Viper
+	c           *bot.Client
+	player      *basic.Player
+	bobberID    int32
+	watch       chan bool
+	vp          *viper.Viper
+	chatHandler *msg.Manager
+	playerList  *playerlist.PlayerList
 )
 
 var updateBobber = bot.PacketHandler{
@@ -47,24 +49,33 @@ var newEntity = bot.PacketHandler{
 //go:embed defaultConfig.toml
 var defaultConfig []byte
 
+// 定义一个全局变量记录是否抛竿
+var isThrow bool = false
+var fullHealth float32 = 20
+
 func main() {
 	log.SetOutput(colorable.NewColorableStdout())
 	log.Println("自动钓鱼机器人")
-	log.Println("版本号：mc1.18.2")
+	log.Println("版本号：mc1.20.1")
 	vp = viper.New()
 	vp.SetConfigName("config")
 	vp.SetConfigType("toml")
 	vp.AddConfigPath(".")
 	if err := vp.ReadInConfig(); err != nil {
 		if _, ok := err.(viper.ConfigFileNotFoundError); ok {
-			ioutil.WriteFile("config.toml", defaultConfig, 0666)
+			os.WriteFile("config.toml", defaultConfig, 0666)
 			log.Fatal("配置文件缺失，已创建默认配置文件，请打开\"config.toml\"修改并保存")
 		} else {
 			log.Fatal(err)
 		}
 	}
 	c = bot.NewClient()
-	player = basic.NewPlayer(c, basic.DefaultSettings)
+	player = basic.NewPlayer(c, basic.DefaultSettings, basic.EventsListener{
+		GameStart:    onGameStart,
+		Disconnect:   onDisconnect,
+		HealthChange: onHelthChange,
+		Death:        onDeath,
+		Teleported:   nil})
 	switch vp.GetString("profile.login") {
 	case "offline":
 		c.Auth.Name = vp.GetString("profile.name")
@@ -90,13 +101,18 @@ func main() {
 	default:
 		log.Fatal("无效的登陆模式")
 	}
-	//注册事件
-	basic.EventsListener{
-		GameStart:  onGameStart,
-		ChatMsg:    onChatMsg,
-		Disconnect: onDisconnect,
-	}.Attach(c)
-	c.Events.AddListener(updateBobber, newEntity)
+	c.Events.AddListener(updateBobber, newEntity, bot.PacketHandler{
+		ID:       packetid.ClientboundSetExperience,
+		Priority: 1,
+		F:        onExperienceChange,
+	})
+	playerList = playerlist.New(c)
+	chatHandler = msg.New(c, player, playerList, msg.EventsHandler{
+		SystemChat:        onSystemChat,
+		PlayerChatMessage: onPlayerChat,
+		DisguisedChat:     onDisguisedChat,
+	})
+
 	addr := net.JoinHostPort(vp.GetString("setting.ip"), strconv.Itoa(vp.GetInt("setting.port")))
 	for {
 		if err := c.JoinServer(addr); err != nil {
@@ -114,9 +130,37 @@ func onGameStart() error {
 	log.Println("加入游戏")
 	watch = make(chan bool)
 	go watchdog()
-	go listenMsg()
 	time.Sleep(3 * time.Second)
 	throw(1)
+	return nil
+}
+
+func onSystemChat(c chat.Message, overlay bool) error {
+	log.Printf("System Chat: %v, Overlay: %v", c, overlay)
+	return nil
+}
+
+func onPlayerChat(c chat.Message, _ bool) error {
+	log.Println("Player Chat:", c)
+	return nil
+}
+
+func onDisguisedChat(c chat.Message) error {
+	log.Println("Disguised Chat:", c)
+	return nil
+}
+
+func onHelthChange(health float32, food int32, saturation float32) error {
+	log.Println("血量:", health, "饱食度:", food, "饱和度:", saturation)
+	if health < fullHealth/2 {
+		logout()
+	}
+	return nil
+}
+
+func onDeath() error {
+	log.Println("死亡")
+	logout()
 	return nil
 }
 
@@ -143,6 +187,7 @@ func checkBobber(p pk.Packet) error {
 	}
 	return nil
 }
+
 func newBobber(p pk.Packet) error {
 	var (
 		EID        pk.VarInt
@@ -157,9 +202,27 @@ func newBobber(p pk.Packet) error {
 	if mobType != pk.VarInt(entity.FishingBobber.ID) {
 		return nil
 	}
-	if data == pk.Int(player.EID) {
+	// if data == pk.Int(player.EID) {
+	// 	bobberID = int32(EID)
+	// }
+	// data获取到的int值似乎并不再是实体owner的EID
+	// 这里只好把逻辑变成了抛竿之后获取到的第一个浮漂的EID认为是自己的浮漂
+	// 但这样在多人并发抛竿场景会判断错误，不过影响有限，暂时先这样
+	if isThrow {
 		bobberID = int32(EID)
+		isThrow = false
 	}
+	return nil
+}
+
+func onExperienceChange(p pk.Packet) error {
+	var (
+		ExperienceBar   pk.Float
+		Level           pk.VarInt
+		TotalExperience pk.VarInt
+	)
+	p.Scan(&ExperienceBar, &Level, &TotalExperience)
+	log.Printf("等级: %.2f\n", float32(Level)+float32(ExperienceBar))
 	return nil
 }
 
@@ -173,6 +236,7 @@ func throw(times int) {
 			time.Sleep(time.Millisecond * 500)
 		}
 	}
+	isThrow = true
 }
 
 func watchdog() {
@@ -189,29 +253,16 @@ func watchdog() {
 	}
 }
 
-func onChatMsg(msg chat.Message, _ byte, _ uuid.UUID) error {
-	log.Println(msg.ClearString())
-	return nil
-}
-
-func listenMsg() {
-	var send []byte
-	for {
-		Reader := bufio.NewReader(os.Stdin)
-		send, _, _ = Reader.ReadLine()
-		if err := sendMsg(string(send)); err != nil {
-			log.Println(err)
-		}
-	}
-}
-
 func useItem() error {
-	return c.Conn.WritePacket(pk.Packet{ID: packetid.ServerboundUseItem, Data: []byte{0}})
+	p := pk.Marshal(
+		packetid.ServerboundUseItem,
+		pk.VarInt(0),
+		pk.VarInt(0),
+	)
+	return c.Conn.WritePacket(p)
 }
 
-func sendMsg(str string) error {
-	if str == "/throw" {
-		return useItem()
-	}
-	return c.Conn.WritePacket(pk.Marshal(packetid.ServerboundChat, pk.String(str)))
+func logout() {
+	//不知道怎么下线，干脆就直接退出
+	os.Exit(0)
 }
